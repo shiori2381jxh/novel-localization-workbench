@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+
+# 运行时数据（其中可能包含加密后的 API Key 和小说正文）
+data/
+
+# Local credentials
+.env
+.env.*
+*.local.json
+*.secrets.json
+credentials*
