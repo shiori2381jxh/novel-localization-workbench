@@ -8,15 +8,17 @@ import os
 import re
 import shutil
 import tempfile
+import threading
+import time
 import uuid
 from ctypes import wintypes
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Iterable
 
 from .domain import (
     DEFAULT_CATEGORIES,
-    FORCED_RENAME_CATEGORIES,
     TRANSLATION_MODES,
     forced_rename_validation_error,
     ImportResult,
@@ -26,6 +28,8 @@ from .domain import (
 
 SCHEMA_VERSION = 1
 PROJECT_MANIFEST = "project.json"
+ATOMIC_REPLACE_ATTEMPTS = 5
+ATOMIC_REPLACE_BASE_DELAY_SECONDS = 0.01
 
 
 def utc_now() -> str:
@@ -39,6 +43,26 @@ def _read_json(path: Path, default=None):
         return json.load(handle)
 
 
+def _replace_with_retry(source, destination) -> None:
+    for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(ATOMIC_REPLACE_BASE_DELAY_SECONDS * (2**attempt))
+
+
+def _project_transaction(method):
+    @wraps(method)
+    def locked(self, project_id, *args, **kwargs):
+        with self.project_lock(project_id):
+            return method(self, project_id, *args, **kwargs)
+
+    return locked
+
+
 def _atomic_write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
@@ -48,7 +72,7 @@ def _atomic_write_json(path: Path, data) -> None:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
-        os.replace(temp_name, path)
+        _replace_with_retry(temp_name, path)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -62,7 +86,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
-        os.replace(temp_name, path)
+        _replace_with_retry(temp_name, path)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -111,6 +135,13 @@ class ProjectStore:
         self.data_root = Path(data_root)
         self.projects_root = self.data_root / "projects"
         self.projects_root.mkdir(parents=True, exist_ok=True)
+        self._project_locks: dict[str, threading.RLock] = {}
+        self._project_locks_guard = threading.Lock()
+
+    def project_lock(self, project_id: str) -> threading.RLock:
+        self.project_dir(project_id)
+        with self._project_locks_guard:
+            return self._project_locks.setdefault(project_id, threading.RLock())
 
     def list_projects(self) -> list[dict]:
         projects: list[dict] = []
@@ -135,6 +166,48 @@ class ProjectStore:
             raise ValidationError("项目路径不合法。")
         return path
 
+    @_project_transaction
+    def refresh_completed_output(self, project_id: str) -> Path:
+        """Refresh the user-facing folder that contains only completed chapter text."""
+        project_dir = self.project_dir(project_id)
+        output_dir = (project_dir / "output").resolve()
+        completed_dir = project_dir / "已完成译文"
+        completed_dir.mkdir(parents=True, exist_ok=True)
+        index_path = completed_dir / ".novel_localizer_completed_output.json"
+        previous_index = _read_json(index_path, {})
+        if not isinstance(previous_index, dict):
+            previous_index = {}
+        previous_names = {
+            str(name)
+            for name in previous_index.get("files", [])
+            if isinstance(name, str)
+        }
+
+        current_names: set[str] = set()
+        manifest = self.load_project(project_id)
+        for chapter in manifest.get("chapters", []):
+            translations = chapter.get("translations", [])
+            if chapter.get("status") != "已翻译" or not translations:
+                continue
+            output_name = str(translations[-1].get("output_name", ""))
+            source_path = (output_dir / output_name).resolve()
+            if (
+                not output_name
+                or source_path.parent != output_dir
+                or not source_path.is_file()
+            ):
+                continue
+            shutil.copy2(source_path, completed_dir / source_path.name)
+            current_names.add(source_path.name)
+
+        completed_dir_resolved = completed_dir.resolve()
+        for stale_name in previous_names - current_names:
+            stale_path = (completed_dir / stale_name).resolve()
+            if stale_path.parent == completed_dir_resolved and stale_path.is_file():
+                stale_path.unlink()
+        _atomic_write_json(index_path, {"files": sorted(current_names)})
+        return completed_dir
+
     def load_project(self, project_id: str) -> dict:
         manifest_path = self.project_dir(project_id) / PROJECT_MANIFEST
         manifest = _read_json(manifest_path)
@@ -142,6 +215,32 @@ class ProjectStore:
             raise ValidationError("项目不存在或项目资料已损坏。")
         return manifest
 
+    def load_translation_checkpoint(
+        self, project_id: str, chapter_id: str
+    ) -> dict | None:
+        checkpoint = _read_json(self._translation_checkpoint_path(project_id, chapter_id))
+        return checkpoint if isinstance(checkpoint, dict) else None
+
+    @_project_transaction
+    def save_translation_checkpoint(
+        self, project_id: str, chapter_id: str, checkpoint: dict
+    ) -> None:
+        if not isinstance(checkpoint, dict):
+            raise ValidationError("翻译检查点格式不正确。")
+        _atomic_write_json(self._translation_checkpoint_path(project_id, chapter_id), checkpoint)
+
+    @_project_transaction
+    def clear_translation_checkpoint(self, project_id: str, chapter_id: str) -> None:
+        path = self._translation_checkpoint_path(project_id, chapter_id)
+        if path.exists():
+            path.unlink()
+
+    def _translation_checkpoint_path(self, project_id: str, chapter_id: str) -> Path:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", chapter_id):
+            raise ValidationError("章节编号不合法。")
+        return self.project_dir(project_id) / "checkpoints" / f"{chapter_id}.translation.json"
+
+    @_project_transaction
     def update_processing_settings(self, project_id: str, settings: dict) -> dict:
         """Persist the translation controls selected for one project."""
         if not isinstance(settings, dict):
@@ -157,6 +256,24 @@ class ProjectStore:
         _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
         return manifest
 
+    def proper_noun_localization_enabled(self, project_id: str) -> bool:
+        """Return the project's forced proper-name localization policy."""
+        manifest = self.load_project(project_id)
+        value = manifest.get("proper_noun_localization", True)
+        return value if isinstance(value, bool) else True
+
+    @_project_transaction
+    def update_project_settings(
+        self, project_id: str, *, proper_noun_localization: bool
+    ) -> dict:
+        if not isinstance(proper_noun_localization, bool):
+            raise ValidationError("专名本地化/改名设置格式不正确。")
+        manifest = self.load_project(project_id)
+        manifest["proper_noun_localization"] = proper_noun_localization
+        manifest["updated_at"] = utc_now()
+        _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
+        return manifest
+
     def create_project(
         self,
         name: str,
@@ -165,6 +282,7 @@ class ProjectStore:
         categories: Iterable[str],
         skill_paths: Iterable[Path | str] = (),
         processing_mode: str | None = None,
+        proper_noun_localization: bool = True,
     ) -> dict:
         clean_name = name.strip()
         if not clean_name:
@@ -175,6 +293,8 @@ class ProjectStore:
             raise ValidationError("请选择原文语言和目标语言。")
         if processing_mode is not None and processing_mode not in TRANSLATION_MODES:
             raise ValidationError("请选择有效的处理模式。")
+        if not isinstance(proper_noun_localization, bool):
+            raise ValidationError("专名本地化/改名设置格式不正确。")
 
         category_names = _normalized_categories(categories)
         project_id = (
@@ -196,6 +316,7 @@ class ProjectStore:
             "categories": category_names,
             "chapters": [],
             "skills": [],
+            "proper_noun_localization": proper_noun_localization,
             "created_at": now,
             "updated_at": now,
         }
@@ -212,6 +333,7 @@ class ProjectStore:
             raise
         return manifest
 
+    @_project_transaction
     def set_processing_mode(self, project_id: str, mode: str) -> dict:
         if mode not in TRANSLATION_MODES:
             raise ValidationError("请选择有效的处理模式。")
@@ -226,6 +348,40 @@ class ProjectStore:
         _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
         return manifest
 
+    def pending_skill_analysis(self, project_id: str) -> list[dict]:
+        """Return Skills whose cached analysis is absent or from different content."""
+        project = self.load_project(project_id)
+        return [
+            dict(skill) for skill in project.get("skills", [])
+            if not isinstance(skill.get("analysis"), dict)
+            or skill["analysis"].get("source_hash") != skill.get("sha256")
+        ]
+
+    @_project_transaction
+    def save_skill_analysis(
+        self, project_id: str, skill_id: str, source_hash: str, rules: dict
+    ) -> dict:
+        if not isinstance(rules, dict):
+            raise ValidationError("Skill 解析结果格式不正确。")
+        manifest = self.load_project(project_id)
+        skill = next(
+            (item for item in manifest.get("skills", []) if item.get("id") == skill_id),
+            None,
+        )
+        if not skill:
+            raise ValidationError("找不到所选 Skill。")
+        if skill.get("sha256") != source_hash:
+            raise ValidationError("Skill 内容已变化，请重新解析。")
+        skill["analysis"] = {
+            "source_hash": source_hash,
+            "rules": rules,
+            "analyzed_at": utc_now(),
+        }
+        manifest["updated_at"] = utc_now()
+        _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
+        return dict(skill)
+
+    @_project_transaction
     def import_chapters(
         self, project_id: str, chapter_paths: Iterable[Path | str]
     ) -> ImportResult:
@@ -265,6 +421,7 @@ class ProjectStore:
                 "bytes": len(data),
                 "characters": len(text),
                 "status": "待处理",
+                "name_mappings": {},
                 "imported_at": utc_now(),
             }
             manifest.setdefault("chapters", []).append(record)
@@ -276,6 +433,7 @@ class ProjectStore:
             _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
         return ImportResult(tuple(imported), tuple(skipped))
 
+    @_project_transaction
     def import_chapter_text(self, project_id: str, text: str) -> ImportResult:
         content = text.strip()
         if not content:
@@ -307,6 +465,7 @@ class ProjectStore:
             "bytes": len(data),
             "characters": len(content),
             "status": "待处理",
+            "name_mappings": {},
             "imported_at": utc_now(),
         }
         manifest.setdefault("chapters", []).append(record)
@@ -314,6 +473,7 @@ class ProjectStore:
         _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
         return ImportResult((record,), ())
 
+    @_project_transaction
     def add_skills(
         self, project_id: str, skill_paths: Iterable[Path | str]
     ) -> list[dict]:
@@ -329,6 +489,7 @@ class ProjectStore:
             _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
         return added
 
+    @_project_transaction
     def add_skill_text(self, project_id: str, text: str) -> list[dict]:
         content = text.strip()
         if not content:
@@ -359,6 +520,7 @@ class ProjectStore:
         _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
         return [record]
 
+    @_project_transaction
     def update_skill(self, project_id: str, skill_id: str, text: str) -> dict:
         content = text.strip()
         if not content:
@@ -386,6 +548,7 @@ class ProjectStore:
         _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
         return dict(record)
 
+    @_project_transaction
     def delete_skills(
         self, project_id: str, skill_ids: Iterable[str]
     ) -> list[dict]:
@@ -411,6 +574,7 @@ class ProjectStore:
         _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
         return [dict(item) for item in deleted]
 
+    @_project_transaction
     def ensure_categories(
         self, project_id: str, categories: Iterable[str]
     ) -> list[str]:
@@ -445,12 +609,52 @@ class ProjectStore:
             for category in manifest.get("categories", [])
         }
 
+    def chapter_mappings(self, project_id: str, chapter_id: str) -> dict[str, dict]:
+        chapter = self.get_chapter(project_id, chapter_id)
+        mappings = chapter.get("name_mappings", {})
+        return json.loads(json.dumps(mappings, ensure_ascii=False)) if isinstance(mappings, dict) else {}
+
+    @_project_transaction
+    def upsert_chapter_mapping(
+        self, project_id: str, chapter_id: str, category: str, source: str,
+        target: str, *, notes: str = "",
+    ) -> dict:
+        manifest = self.load_project(project_id)
+        if category not in manifest.get("categories", []):
+            raise ValidationError(f"项目中没有“{category}”替换类别。")
+        source_value, target_value = source.strip(), target.strip()
+        if not source_value or not target_value:
+            raise ValidationError("原词和替换词都不能为空。")
+        error = forced_rename_validation_error(category, source_value, target_value)
+        if error:
+            raise ValidationError(error)
+        chapter = next((item for item in manifest.get("chapters", []) if item.get("id") == chapter_id), None)
+        if not chapter:
+            raise ValidationError("找不到所选章节。")
+        entries = chapter.setdefault("name_mappings", {}).setdefault(category, {})
+        record = {
+            "source": source_value, "target": target_value, "notes": notes.strip(),
+            "status": "已确认", "updated_at": utc_now(),
+        }
+        entries[source_value] = record
+        manifest["updated_at"] = utc_now()
+        _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
+        return dict(record)
+
+    def chapter_prompt_mappings(self, project_id: str, chapter_id: str) -> dict[str, list[dict]]:
+        return {
+            category: [dict(record) for record in entries.values() if record.get("status") == "已确认"]
+            for category, entries in self.chapter_mappings(project_id, chapter_id).items()
+            if isinstance(entries, dict)
+        }
+
     def chapter_replacements(self, project_id: str, chapter_id: str) -> list[dict]:
-        source_text = self.read_chapter_text(project_id, chapter_id)
         rows: list[dict] = []
-        for category, registry in self.load_all_replacements(project_id).items():
-            for source, record in registry.get("entries", {}).items():
-                if chapter_id not in record.get("source_chapters", []) and source not in source_text:
+        for category, entries in self.chapter_mappings(project_id, chapter_id).items():
+            if not isinstance(entries, dict):
+                continue
+            for source, record in entries.items():
+                if not isinstance(record, dict):
                     continue
                 rows.append(
                     {
@@ -463,6 +667,7 @@ class ProjectStore:
                 )
         return sorted(rows, key=lambda item: (item["category"], item["source"]))
 
+    @_project_transaction
     def delete_chapters(
         self, project_id: str, chapter_ids: Iterable[str]
     ) -> list[dict]:
@@ -587,6 +792,7 @@ class ProjectStore:
             raise ValidationError("Skill 文件路径无效。")
         return path
 
+    @_project_transaction
     def save_translation(
         self,
         project_id: str,
@@ -605,9 +811,10 @@ class ProjectStore:
         memory_version: int = 0,
         skill_hash: str = "",
         skill_files: Iterable[str] = (),
+        allow_empty: bool = False,
     ) -> dict:
         clean_text = translated_text.strip()
-        if not clean_text:
+        if not clean_text and not allow_empty:
             raise ValidationError("译文为空，无法保存。")
 
         project_dir = self.project_dir(project_id)
@@ -623,49 +830,94 @@ class ProjectStore:
         if not chapter:
             raise ValidationError("找不到要保存译文的章节。")
 
-        source_stem = Path(chapter.get("source_name", "章节")).stem
-        output_path = self._available_destination(
-            project_dir / "output", f"{source_stem}_译文.txt"
-        )
-        _atomic_write_text(output_path, clean_text + "\n")
+        output_dir = project_dir / "output"
+        output_dir_resolved = output_dir.resolve()
+        previous_records = list(chapter.get("translations", []))
 
-        now = utc_now()
-        record = {
-            "id": uuid.uuid4().hex,
-            "output_name": output_path.name,
-            "profile_id": profile_id,
-            "provider": provider,
-            "model": model,
-            "usage": usage or {},
-            "replacements_added": replacements_added,
-            "warnings": [str(item) for item in warnings],
-            "mode": mode,
-            "review_status": review_status,
-            "residual_sources": [str(item) for item in residual_sources],
-            "memory_version": int(memory_version),
-            "skill_hash": skill_hash,
-            "skill_files": [str(item) for item in skill_files],
-            "created_at": now,
+        def output_file(name: object) -> Path | None:
+            path = (output_dir / str(name or "")).resolve()
+            return path if path.parent == output_dir_resolved else None
+
+        latest_record = previous_records[-1] if previous_records else {}
+        output_path = output_file(latest_record.get("output_name"))
+        if output_path is None:
+            source_stem = Path(chapter.get("source_name", "章节")).stem
+            output_path = self._available_destination(
+                output_dir, f"{source_stem}_译文.txt"
+            )
+        metadata_path = output_file(latest_record.get("metadata_name"))
+        if metadata_path is None:
+            metadata_path = output_path.with_suffix(".translation.json")
+
+        previous_files = {
+            path: path.read_text(encoding="utf-8")
+            for record in previous_records
+            for path in (
+                output_file(record.get("output_name")),
+                output_file(record.get("metadata_name")),
+            )
+            if path is not None and path.is_file()
         }
-        metadata_path = output_path.with_suffix(".translation.json")
-        _atomic_write_json(
-            metadata_path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "project_id": project_id,
-                "chapter_id": chapter_id,
-                **record,
-            },
-        )
-        record["metadata_name"] = metadata_path.name
-        chapter.setdefault("translations", []).append(record)
-        chapter["status"] = "需要复核" if review_status == "需要复核" else "已翻译"
-        chapter["last_error"] = ""
-        chapter["translated_at"] = now
-        manifest["updated_at"] = now
-        _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
+        try:
+            _atomic_write_text(output_path, clean_text + "\n")
+            now = utc_now()
+            record = {
+                "id": uuid.uuid4().hex,
+                "output_name": output_path.name,
+                "profile_id": profile_id,
+                "provider": provider,
+                "model": model,
+                "usage": usage or {},
+                "replacements_added": replacements_added,
+                "warnings": [str(item) for item in warnings],
+                "mode": mode,
+                "review_status": review_status,
+                "residual_sources": [str(item) for item in residual_sources],
+                "memory_version": int(memory_version),
+                "skill_hash": skill_hash,
+                "skill_files": [str(item) for item in skill_files],
+                "created_at": now,
+            }
+            _atomic_write_json(
+                metadata_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "project_id": project_id,
+                    "chapter_id": chapter_id,
+                    **record,
+                },
+            )
+            record["metadata_name"] = metadata_path.name
+            chapter["translations"] = [record]
+            chapter["status"] = "需要复核" if review_status == "需要复核" else "已翻译"
+            chapter["last_error"] = ""
+            chapter["translated_at"] = now
+            manifest["updated_at"] = now
+            _atomic_write_json(project_dir / PROJECT_MANIFEST, manifest)
+        except Exception:
+            for created_path in (metadata_path, output_path):
+                if created_path in previous_files:
+                    try:
+                        _atomic_write_text(created_path, previous_files[created_path])
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    if created_path.is_file():
+                        created_path.unlink()
+                except OSError:
+                    pass
+            raise
+        for stale_path in previous_files:
+            if stale_path in {output_path, metadata_path}:
+                continue
+            try:
+                stale_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return record
 
+    @_project_transaction
     def record_translation_failure(
         self, project_id: str, chapter_id: str, error: str
     ) -> None:
@@ -680,12 +932,50 @@ class ProjectStore:
         )
         if not chapter:
             return
+        translations = chapter.get("translations", [])
+        if translations:
+            chapter["status"] = (
+                "需要复核"
+                if translations[-1].get("review_status") == "需要复核"
+                else "已翻译"
+            )
+            chapter["last_error"] = ""
+            chapter["failed_at"] = ""
+            manifest["updated_at"] = utc_now()
+            _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
+            return
         chapter["status"] = "翻译失败"
         chapter["last_error"] = str(error)[:1000]
         chapter["failed_at"] = utc_now()
         manifest["updated_at"] = utc_now()
         _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
 
+    @_project_transaction
+    def record_residual_resolution_failure(
+        self, project_id: str, chapter_id: str, residual_sources: Iterable[str]
+    ) -> None:
+        """Keep the last translation while surfacing exhausted residual retries."""
+        manifest = self.load_project(project_id)
+        chapter = next(
+            (
+                item for item in manifest.get("chapters", [])
+                if item.get("id") == chapter_id
+            ),
+            None,
+        )
+        if not chapter:
+            return
+        sources = [str(item).strip() for item in residual_sources if str(item).strip()]
+        now = utc_now()
+        chapter["status"] = "翻译失败"
+        chapter["last_error"] = (
+            "残留原词在三次 API 润色后仍未解决：" + "、".join(sources)
+        )[:1000]
+        chapter["failed_at"] = now
+        manifest["updated_at"] = now
+        _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
+
+    @_project_transaction
     def mark_chapters_retrying(
         self, project_id: str, chapter_ids: Iterable[str]
     ) -> dict:
@@ -697,6 +987,69 @@ class ProjectStore:
                 chapter["status"] = "重试中"
                 chapter["last_error"] = ""
                 changed = True
+        if changed:
+            manifest["updated_at"] = utc_now()
+            _atomic_write_json(
+                self.project_dir(project_id) / PROJECT_MANIFEST, manifest
+            )
+        return manifest
+
+    @_project_transaction
+    def mark_chapters_queued(
+        self, project_id: str, chapter_ids: Iterable[str]
+    ) -> dict:
+        """Persist the visible batch queue state before workers begin."""
+        ids = set(chapter_ids)
+        manifest = self.load_project(project_id)
+        changed = False
+        for chapter in manifest.get("chapters", []):
+            if chapter.get("id") in ids:
+                chapter["status"] = "队列中"
+                chapter["last_error"] = ""
+                changed = True
+        if changed:
+            manifest["updated_at"] = utc_now()
+            _atomic_write_json(
+                self.project_dir(project_id) / PROJECT_MANIFEST, manifest
+            )
+        return manifest
+
+    @_project_transaction
+    def mark_chapter_processing(self, project_id: str, chapter_id: str) -> None:
+        """Persist that a worker has started sending this chapter to the model."""
+        manifest = self.load_project(project_id)
+        chapter = next(
+            (item for item in manifest.get("chapters", []) if item.get("id") == chapter_id),
+            None,
+        )
+        if not chapter:
+            return
+        chapter["status"] = "处理中"
+        chapter["last_error"] = ""
+        manifest["updated_at"] = utc_now()
+        _atomic_write_json(self.project_dir(project_id) / PROJECT_MANIFEST, manifest)
+
+    @_project_transaction
+    def restore_interrupted_chapters(
+        self, project_id: str, chapter_ids: Iterable[str]
+    ) -> dict:
+        ids = set(chapter_ids)
+        manifest = self.load_project(project_id)
+        changed = False
+        for chapter in manifest.get("chapters", []):
+            if chapter.get("id") not in ids or chapter.get("status") not in {
+                "队列中", "处理中", "重试中"
+            }:
+                continue
+            translations = chapter.get("translations", [])
+            if not translations:
+                chapter["status"] = "待处理"
+            elif translations[-1].get("review_status") == "需要复核":
+                chapter["status"] = "需要复核"
+            else:
+                chapter["status"] = "已翻译"
+            chapter["last_error"] = ""
+            changed = True
         if changed:
             manifest["updated_at"] = utc_now()
             _atomic_write_json(
@@ -720,6 +1073,7 @@ class ProjectStore:
             return None
         return path.read_text(encoding="utf-8")
 
+    @_project_transaction
     def upsert_replacement(
         self,
         project_id: str,
@@ -770,6 +1124,7 @@ class ProjectStore:
         _atomic_write_json(self._registry_path(project_dir, category), registry)
         return record
 
+    @_project_transaction
     def confirm_replacement(
         self, project_id: str, category: str, source: str, target: str,
         *, notes: str = "", allow_user_override: bool = False,

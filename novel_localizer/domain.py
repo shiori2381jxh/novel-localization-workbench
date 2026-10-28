@@ -23,13 +23,17 @@ LANGUAGE_OPTIONS = (
 )
 
 TRANSLATION_MODES = (
-    "中文小说 → 日语本地化",
-    "日语原文 → 改名润色",
+    "翻译",
+    "润色",
 )
 
 FORCED_RENAME_CATEGORIES = frozenset(
     {"人名", "地名", "家族名", "组织名", "机构名", "种族名"}
 )
+
+FORCED_RENAME_CATEGORY_ALIASES = {
+    "種族名": "种族名",
+}
 
 AUTO_ENTITY_CATEGORIES = (
     "人名", "地名", "家族名", "组织名", "机构名", "种族名", "技能名", "道具名"
@@ -40,13 +44,19 @@ def is_valid_prompt_mapping(category: str, source: str, target: str) -> bool:
     return forced_rename_validation_error(category, source, target) is None
 
 
+def is_forced_rename_category(category: object) -> bool:
+    value = str(category).strip()
+    canonical = FORCED_RENAME_CATEGORY_ALIASES.get(value, value)
+    return canonical in FORCED_RENAME_CATEGORIES
+
+
 def forced_rename_validation_error(category: str, source: str, target: str) -> str | None:
     """Return a user-facing error when a forced rename is too close to its source."""
     source_value = source.strip()
     target_value = target.strip()
     if not source_value or not target_value:
         return "原词和替换词都不能为空。"
-    if category not in FORCED_RENAME_CATEGORIES:
+    if not is_forced_rename_category(category):
         return None
     source_compact = _compact_name(source_value)
     target_compact = _compact_name(target_value)

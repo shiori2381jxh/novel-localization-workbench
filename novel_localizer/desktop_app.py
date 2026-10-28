@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QLockFile, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,10 +36,13 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStyle,
+    QSystemTrayIcon,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QFileDialog,
@@ -148,6 +151,13 @@ QPushButton {
 }
 QPushButton:hover { background: #F7F8FB; border-color: #AEB6C7; }
 QPushButton:pressed { background: #ECEEF3; }
+QToolButton {
+    background: #FFFFFF;
+    border: 1px solid #CBD2DF;
+    border-radius: 7px;
+}
+QToolButton:hover { background: #F7F8FB; border-color: #AEB6C7; }
+QToolButton:pressed { background: #ECEEF3; }
 QPushButton#Primary {
     color: white;
     background: #5B5BD6;
@@ -310,6 +320,7 @@ class ConnectionTestWorker(QThread):
 
 class TranslationWorker(QThread):
     progress_changed = Signal(int, int, str)
+    chapter_started = Signal(str)
     chapter_succeeded = Signal(str, object)
     chapter_failed = Signal(str, str)
     task_finished = Signal(bool)
@@ -342,9 +353,36 @@ class TranslationWorker(QThread):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_message.emit(f"[{timestamp}] {message}")
 
+    def _replacement_snapshot(self) -> set[tuple[str, str, str]]:
+        return {
+            (str(category), str(source), str(record.get("target", "")))
+            for category, registry in self.store.load_all_replacements(self.project_id).items()
+            for source, record in registry.get("entries", {}).items()
+        }
+
+    def _resolve_residuals_with_api(
+        self, engine: TranslationEngine, chapter_id: str, initial_result: dict
+    ) -> tuple[dict, list[str] | None]:
+        result = initial_result
+        for attempt in range(1, 4):
+            if self.cancel_event.is_set():
+                raise TranslationCancelled("任务已取消。")
+            self._emit_log(f"  发现残留原词，自动 API 润色第 {attempt}/3 次…")
+            result = engine.polish_review_chapter(
+                self.project_id, chapter_id, self.profile,
+                extra_instructions=self.extra_instructions,
+                max_output_tokens=self.max_output_tokens,
+                cancel_event=self.cancel_event,
+            )
+            if not result.get("residual_sources"):
+                self._emit_log(f"  自动 API 润色第 {attempt}/3 次已解决残留。")
+                return result, None
+        return result, list(result.get("residual_sources", []))
+
     def run(self):
         total = len(self.chapter_ids)
         cancelled = False
+        cancelled_count = 0
         succeeded = 0
         failed = 0
         batch_started_at = time.monotonic()
@@ -357,29 +395,72 @@ class TranslationWorker(QThread):
                 extra_instructions=self.extra_instructions,
             )
         )
+
+        def record_failure_safely(chapter_id: str, error: Exception | str) -> None:
+            error_text = str(error)
+            try:
+                self.store.record_translation_failure(
+                    self.project_id, chapter_id, error_text
+                )
+            except Exception as persistence_error:
+                self._emit_log(
+                    f"  无法记录失败状态：{type(persistence_error).__name__}："
+                    f"{persistence_error}"
+                )
+                try:
+                    self.store.restore_interrupted_chapters(
+                        self.project_id, [chapter_id]
+                    )
+                except Exception as restore_error:
+                    self._emit_log(
+                        f"  无法恢复章节状态：{type(restore_error).__name__}："
+                        f"{restore_error}"
+                    )
+            self.chapter_failed.emit(chapter_id, error_text)
+
+        try:
+            pending_skills = self.store.pending_skill_analysis(self.project_id)
+            if pending_skills:
+                self._emit_log(f"正在解析 {len(pending_skills)} 份新增或已修改的 Skill…")
+                TranslationEngine(
+                    self.store, ModelClient(log_callback=self._emit_log)
+                ).analyze_pending_skills(
+                    self.project_id, self.profile, self.cancel_event
+                )
+                self._emit_log("Skill 解析完成；后续未修改时不会再次调用 API。")
+        except Exception as exc:
+            for chapter_id in self.chapter_ids:
+                record_failure_safely(chapter_id, exc)
+            self._emit_log(f"Skill 解析失败，未发送正文：{type(exc).__name__}：{exc}")
+            self.task_finished.emit(isinstance(exc, TranslationCancelled))
+            return
         result_signal_lock = threading.Lock()
 
         def translate_one(chapter_id):
+            if self.cancel_event.is_set():
+                raise TranslationCancelled("任务已取消。")
             engine = TranslationEngine(
                 self.store,
                 ModelClient(log_callback=self._emit_log),
             )
             chapter = self.store.get_chapter(self.project_id, chapter_id)
             name = chapter.get("source_name", "章节")
+            self.store.mark_chapter_processing(self.project_id, chapter_id)
+            self.chapter_started.emit(chapter_id)
             chapter_started_at = time.monotonic()
             self._emit_log(
                 f"开始翻译 {name}；原文字数={chapter.get('characters', '未知')}"
             )
             result = engine.translate_chapter(
-                    self.project_id,
-                    chapter_id,
-                    self.profile,
-                    mode=self.mode,
-                    extra_instructions=self.extra_instructions,
-                    max_output_tokens=self.max_output_tokens,
-                    cancel_event=self.cancel_event,
-                    allow_unprepared=False,
-                )
+                self.project_id,
+                chapter_id,
+                self.profile,
+                mode=self.mode,
+                extra_instructions=self.extra_instructions,
+                max_output_tokens=self.max_output_tokens,
+                cancel_event=self.cancel_event,
+                allow_unprepared=False,
+            )
             with result_signal_lock:
                 self.chapter_succeeded.emit(chapter_id, result)
             elapsed = time.monotonic() - chapter_started_at
@@ -403,21 +484,26 @@ class TranslationWorker(QThread):
                     succeeded += 1
                 except TranslationCancelled:
                     cancelled = True
+                    cancelled_count += 1
                     self._emit_log("任务已取消。")
                 except Exception as exc:
                     failed += 1
-                    self.store.record_translation_failure(
-                        self.project_id, chapter_id, str(exc)
-                    )
-                    self.chapter_failed.emit(chapter_id, str(exc))
+                    record_failure_safely(chapter_id, exc)
                     self._emit_log(
                         f"失败 {chapter_id}：{type(exc).__name__}：{exc}"
                     )
                     self._emit_log("  已跳过失败章节，继续处理队列中的下一章。")
                 self.progress_changed.emit(
-                    succeeded + failed, total,
-                    f"已处理 {succeeded + failed}/{total}"
+                    succeeded + failed + cancelled_count, total,
+                    f"已处理 {succeeded + failed + cancelled_count}/{total}"
                 )
+        if cancelled:
+            try:
+                self.store.restore_interrupted_chapters(
+                    self.project_id, self.chapter_ids
+                )
+            except Exception as exc:
+                self._emit_log(f"取消后无法恢复章节状态：{type(exc).__name__}：{exc}")
         batch_elapsed = time.monotonic() - batch_started_at
         self._emit_log(
             f"批次结束：成功={succeeded}，失败={failed}，"
@@ -563,6 +649,13 @@ class ProjectImportTab(QWidget):
         self.processing_mode_combo = QComboBox()
         self.processing_mode_combo.addItem("请选择处理模式", None)
         self.processing_mode_combo.addItems(TRANSLATION_MODES)
+        self.rename_mode_combo = QComboBox()
+        self.rename_mode_combo.addItem("开", True)
+        self.rename_mode_combo.addItem("关", False)
+        self.save_project_settings_button = QPushButton("保存项目设置")
+        self.save_project_settings_button.clicked.connect(
+            self.save_project_settings
+        )
         self.categories_edit = QLineEdit("、".join(DEFAULT_CATEGORIES))
         fields.addWidget(label("项目名称"), 0, 0)
         fields.addWidget(self.name_edit, 0, 1)
@@ -575,8 +668,11 @@ class ProjectImportTab(QWidget):
         fields.addWidget(self.target_combo, 2, 3)
         fields.addWidget(label("处理模式"), 3, 0)
         fields.addWidget(self.processing_mode_combo, 3, 1, 1, 3)
-        fields.addWidget(label("替换类别"), 4, 0)
-        fields.addWidget(self.categories_edit, 4, 1, 1, 3)
+        fields.addWidget(label("专名本地化/改名"), 4, 0)
+        fields.addWidget(self.rename_mode_combo, 4, 1, 1, 2)
+        fields.addWidget(self.save_project_settings_button, 4, 3)
+        fields.addWidget(label("替换类别"), 5, 0)
+        fields.addWidget(self.categories_edit, 5, 1, 1, 3)
         fields.setColumnStretch(1, 1)
         fields.setColumnStretch(3, 1)
         form.addLayout(fields)
@@ -723,9 +819,13 @@ class ProjectImportTab(QWidget):
         self.source_combo.setEnabled(is_new)
         self.target_combo.setEnabled(is_new)
         self.processing_mode_combo.setEnabled(is_new)
+        self.rename_mode_combo.setEnabled(True)
+        self.save_project_settings_button.setVisible(not is_new)
         self.import_button.setText("创建项目并导入" if is_new else "加入所选项目")
         self.skill_management_widget.setVisible(not is_new)
         if is_new:
+            rename_index = self.rename_mode_combo.findData(True)
+            self.rename_mode_combo.setCurrentIndex(max(0, rename_index))
             self.status_title.setText("新项目")
             self.status_text.setText(
                 "导入时会创建项目资料、替换清单、规则目录和译文目录。"
@@ -743,6 +843,11 @@ class ProjectImportTab(QWidget):
         self.source_combo.setCurrentText(project.get("source_language", ""))
         self.target_combo.setCurrentText(project.get("target_language", ""))
         self.categories_edit.setText("、".join(project.get("categories", [])))
+        rename_enabled = project.get("proper_noun_localization", True)
+        rename_index = self.rename_mode_combo.findData(
+            rename_enabled if isinstance(rename_enabled, bool) else True
+        )
+        self.rename_mode_combo.setCurrentIndex(max(0, rename_index))
         mode = project.get("processing_mode")
         mode_index = self.processing_mode_combo.findText(str(mode))
         if mode in TRANSLATION_MODES and mode_index >= 0:
@@ -760,6 +865,29 @@ class ProjectImportTab(QWidget):
             f"规则文件 {len(project.get('skills', []))} 个。"
         )
         self.refresh_existing_skills(project["id"])
+
+    def save_project_settings(self):
+        project = self.current_project()
+        if not project:
+            QMessageBox.warning(self, "无法保存", "请选择已有项目。")
+            return
+        try:
+            updated = self.store.update_project_settings(
+                project["id"],
+                proper_noun_localization=bool(
+                    self.rename_mode_combo.currentData()
+                ),
+            )
+            self.refresh_projects(updated["id"])
+            self.projects_changed.emit()
+            state = "开" if updated["proper_noun_localization"] else "关"
+            QMessageBox.information(
+                self,
+                "保存完成",
+                f"已保存到项目“{updated['name']}”：专名本地化/改名为{state}。",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "无法保存项目设置", str(exc))
 
     def refresh_existing_skills(self, project_id: str):
         self.existing_skills.clear()
@@ -805,6 +933,12 @@ class ProjectImportTab(QWidget):
         if not selected or not project:
             QMessageBox.warning(self, "无法删除", "请至少选择一个已有 Skill。")
             return
+        pending_skill_count = len(self.store.pending_skill_analysis(project["id"]))
+        skill_analysis_notice = (
+            f"\n\n其中有 {pending_skill_count} 份新增或已修改的 Skill，将先各解析一次；"
+            "未修改的 Skill 不会重复解析。"
+            if pending_skill_count else ""
+        )
         answer = QMessageBox.question(
             self,
             "确认删除",
@@ -843,6 +977,9 @@ class ProjectImportTab(QWidget):
                     categories,
                     skill_paths,
                     processing_mode=processing_mode,
+                    proper_noun_localization=bool(
+                        self.rename_mode_combo.currentData()
+                    ),
                 )
             else:
                 project = self.current_project()
@@ -1247,13 +1384,60 @@ def available_name_candidates(store: ProjectStore, project_id: str) -> list[str]
 
 
 def split_review_edits(edits: list[dict]) -> tuple[list[dict], list[str]]:
-    """Separate no-cost local decisions from sources explicitly sent for retry."""
+    """Separate no-cost local decisions from sources sent to automatic API review."""
     local = [item for item in edits if item.get("action") in {"ignore", "map"}]
     retries = [
         str(item.get("source", "")).strip()
         for item in edits if item.get("action") == "retry" and str(item.get("source", "")).strip()
     ]
     return local, retries
+
+
+def format_automatic_review_summary(project: dict, *, cancelled: bool) -> str:
+    """Describe the final persisted state after a whole-project API review."""
+    chapters = list(project.get("chapters", []))
+    translated = sum(item.get("status") == "已翻译" for item in chapters)
+    review = sum(item.get("status") == "需要复核" for item in chapters)
+    failed = sum(item.get("status") == "翻译失败" for item in chapters)
+    prefix = "全书自动复核已取消" if cancelled else "全书自动复核结束"
+    return (
+        f"{prefix}：已翻译 {translated} 章；需要复核 {review} 章；"
+        f"翻译失败 {failed} 章。"
+    )
+
+
+def format_automatic_review_report(report: dict | None, summary: str) -> str:
+    """Make the automatic-review outcome explicit for the user."""
+    if not report:
+        return "API 实体复核没有返回可用结果。\n" + summary
+    if not report.get("success"):
+        return f"API 实体复核失败，未开始重译：{report.get('error', '未知错误')}\n{summary}"
+    mappings = list(report.get("mappings", []))
+    if not mappings:
+        return (
+            "API 全章润色重做已完成；每章均按自身完整原文和旧译文核对，"
+            "未使用其他文件的同名映射。\n" + summary
+        )
+    samples = "、".join(
+        f"{item.get('source', '')} → {item.get('target', '')}"
+        for item in mappings[:12]
+    )
+    mapping_text = (
+        f"自动新增或更新 {len(mappings)} 条名称映射"
+        + (f"：{samples}" if samples else "。")
+    )
+    return f"API 实体复核完成；{mapping_text}\n{summary}"
+
+
+def chapters_requiring_review(project: dict) -> list[str]:
+    """Return only chapters whose latest saved translation still needs review."""
+    return [
+        str(chapter["id"])
+        for chapter in project.get("chapters", [])
+        if chapter.get("id")
+        and chapter.get("translations")
+        and chapter["translations"][-1].get("review_status") == "需要复核"
+    ]
 
 
 class ResidualReviewDialog(QDialog):
@@ -1267,7 +1451,7 @@ class ResidualReviewDialog(QDialog):
         self._rows: list[dict] = []
         layout = QVBoxLayout(self)
         layout.addWidget(label(
-            "请选择每个残留的处理方式。只有“用 API 重做”会产生额外费用。", "Hint"
+            "“用 API 重做”会自动复核实体、生成新名称并使用全文重译；会产生额外费用。", "Hint"
         ))
         categories = list(dict.fromkeys(
             list(project.get("categories", [])) + ["人名", "地名", "家族名", "组织名", "机构名", "种族名"]
@@ -1284,6 +1468,8 @@ class ResidualReviewDialog(QDialog):
             category.addItems(categories)
             target = QLineEdit()
             target.setPlaceholderText("输入新的名称")
+            notes = QLineEdit()
+            notes.setPlaceholderText("角色身份、关系或出现语境（单字名使用 API 重做时必填）")
             pool = QComboBox()
             pool.addItem("从名字库选择（仅人名）", "")
             for name in candidates:
@@ -1295,8 +1481,10 @@ class ResidualReviewDialog(QDialog):
             fields.addWidget(label("新名称", "Hint"), 1, 0)
             fields.addWidget(target, 1, 1, 1, 3)
             fields.addWidget(pool, 2, 1, 1, 3)
+            fields.addWidget(label("角色 / 语境说明", "Hint"), 3, 0)
+            fields.addWidget(notes, 3, 1, 1, 3)
             row = {"source": source, "action": action, "category": category,
-                   "target": target, "pool": pool}
+                   "target": target, "notes": notes, "pool": pool}
             self._rows.append(row)
             action.currentIndexChanged.connect(lambda _=0, row=row: self._update_row(row))
             category.currentTextChanged.connect(lambda _="", row=row: self._update_row(row))
@@ -1316,6 +1504,7 @@ class ResidualReviewDialog(QDialog):
         mapping = row["action"].currentData() == "map"
         row["category"].setEnabled(mapping)
         row["target"].setEnabled(mapping)
+        row["notes"].setEnabled(mapping)
         row["pool"].setEnabled(mapping and row["category"].currentText() == "人名")
 
     def _choose_pool_name(self, row: dict) -> None:
@@ -1335,6 +1524,7 @@ class ResidualReviewDialog(QDialog):
             "source": row["source"], "action": str(row["action"].currentData()),
             "category": row["category"].currentText(),
             "target": row["target"].text().strip(),
+            "notes": row["notes"].text().strip(),
         } for row in self._rows]
 
 
@@ -1346,8 +1536,6 @@ class TranslationTab(QWidget):
         self.projects: list[dict] = []
         self.profiles: list[dict] = []
         self.worker: TranslationWorker | None = None
-        self.pending_retries: list[tuple[str, list[str]]] = []
-        self.retry_in_progress = False
         self.row_by_chapter: dict[str, int] = {}
         self._restoring_processing_settings = False
         self._build()
@@ -1368,11 +1556,28 @@ class TranslationTab(QWidget):
         heading_text.addWidget(label("翻译处理", "SectionTitle"))
         heading.addLayout(heading_text)
         heading.addStretch()
-        self.open_output_button = QPushButton("打开译文目录")
+        self.processing_controls_toggle = QToolButton()
+        self.processing_controls_toggle.setArrowType(Qt.ArrowType.UpArrow)
+        self.processing_controls_toggle.setToolTip("收起翻译设置")
+        self.processing_controls_toggle.setFixedSize(36, 36)
+        self.processing_controls_toggle.clicked.connect(self.toggle_processing_controls)
+        heading.addWidget(self.processing_controls_toggle)
+        self.open_output_button = QToolButton()
+        self.open_output_button.setText("打开译文目录")
+        self.open_output_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.open_output_button.clicked.connect(self.open_output_folder)
+        output_menu = QMenu(self.open_output_button)
+        output_menu.addAction("打开全部译文目录", self.open_output_folder)
+        output_menu.addAction("打开已完成译文目录", self.open_completed_output_folder)
+        self.open_output_button.setMenu(output_menu)
         heading.addWidget(self.open_output_button)
         controls.addLayout(heading)
 
+        self.processing_controls_body = QWidget()
+        self._processing_controls_expanded = True
+        processing_controls_layout = QVBoxLayout(self.processing_controls_body)
+        processing_controls_layout.setContentsMargins(0, 0, 0, 0)
+        processing_controls_layout.setSpacing(8)
         setup = QGridLayout()
         setup.setHorizontalSpacing(12)
         setup.setVerticalSpacing(9)
@@ -1396,29 +1601,26 @@ class TranslationTab(QWidget):
         setup.addWidget(self.max_tokens, 1, 3)
         setup.setColumnStretch(1, 1)
         setup.setColumnStretch(3, 1)
-        controls.addLayout(setup)
+        processing_controls_layout.addLayout(setup)
         extra_header = QHBoxLayout()
         extra_header.addWidget(label("本次额外要求（可选）", "Hint"))
         extra_header.addStretch()
-        self.save_extra_instructions = QCheckBox("保存到此项目")
+        self.save_extra_instructions = QCheckBox("同时保存额外要求")
         extra_header.addWidget(self.save_extra_instructions)
         self.save_settings_button = QPushButton("保存项目配置")
         self.save_settings_button.clicked.connect(self.save_processing_settings)
         extra_header.addWidget(self.save_settings_button)
-        controls.addLayout(extra_header)
+        processing_controls_layout.addLayout(extra_header)
         self.extra_instructions = QTextEdit()
         self.extra_instructions.setPlaceholderText(
             "例如：保留轻小说语气；钱二说话更冷淡；料理名称优先使用日本常见叫法……"
         )
         self.extra_instructions.setMaximumHeight(54)
-        controls.addWidget(self.extra_instructions)
-        self.profile_combo.currentIndexChanged.connect(self.save_processing_settings)
-        self.max_tokens.valueChanged.connect(self.save_processing_settings)
-        self.extra_instructions.textChanged.connect(self.save_processing_settings)
-        self.save_extra_instructions.toggled.connect(self.save_processing_settings)
+        processing_controls_layout.addWidget(self.extra_instructions)
+        controls.addWidget(self.processing_controls_body)
         root.addWidget(controls_card)
 
-        center = QSplitter(Qt.Orientation.Horizontal)
+        self.queue_preview_splitter = QSplitter(Qt.Orientation.Horizontal)
         queue_card = card()
         queue = QVBoxLayout(queue_card)
         queue.setContentsMargins(14, 14, 14, 14)
@@ -1465,12 +1667,26 @@ class TranslationTab(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.chapter_table.itemSelectionChanged.connect(self.preview_selected)
         queue.addWidget(self.chapter_table)
-        center.addWidget(queue_card)
+        self.queue_preview_splitter.addWidget(queue_card)
 
-        preview_card = card()
-        preview = QVBoxLayout(preview_card)
+        self.preview_card = card()
+        preview = QVBoxLayout(self.preview_card)
         preview.setContentsMargins(14, 14, 14, 14)
-        preview.addWidget(label("章节预览", "CardTitle"))
+        preview_header = QHBoxLayout()
+        self.preview_title = label("章节预览", "CardTitle")
+        preview_header.addWidget(self.preview_title)
+        preview_header.addStretch()
+        self.preview_toggle = QToolButton()
+        self.preview_toggle.setArrowType(Qt.ArrowType.UpArrow)
+        self.preview_toggle.setToolTip("收起预览")
+        self.preview_toggle.setFixedSize(36, 36)
+        self.preview_toggle.clicked.connect(self.toggle_preview)
+        preview_header.addWidget(self.preview_toggle)
+        preview.addLayout(preview_header)
+        self.preview_body = QWidget()
+        self._preview_expanded = True
+        preview_body_layout = QVBoxLayout(self.preview_body)
+        preview_body_layout.setContentsMargins(0, 0, 0, 0)
         preview_split = QSplitter(Qt.Orientation.Vertical)
         original_box = QWidget()
         original_layout = QVBoxLayout(original_box)
@@ -1488,9 +1704,10 @@ class TranslationTab(QWidget):
         translated_layout.addWidget(self.translation_preview)
         preview_split.addWidget(original_box)
         preview_split.addWidget(translated_box)
-        preview.addWidget(preview_split)
-        center.addWidget(preview_card)
-        center.setSizes([620, 500])
+        preview_body_layout.addWidget(preview_split)
+        preview.addWidget(self.preview_body)
+        self.queue_preview_splitter.addWidget(self.preview_card)
+        self.queue_preview_splitter.setSizes([620, 500])
         footer_card = card()
         footer = QVBoxLayout(footer_card)
         footer.setContentsMargins(16, 13, 16, 13)
@@ -1521,7 +1738,7 @@ class TranslationTab(QWidget):
         footer.addLayout(bottom)
         self.content_splitter = QSplitter(Qt.Orientation.Vertical)
         self.content_splitter.setChildrenCollapsible(False)
-        self.content_splitter.addWidget(center)
+        self.content_splitter.addWidget(self.queue_preview_splitter)
         self.content_splitter.addWidget(footer_card)
         self.content_splitter.setStretchFactor(0, 3)
         self.content_splitter.setStretchFactor(1, 2)
@@ -1529,9 +1746,34 @@ class TranslationTab(QWidget):
         root.addWidget(self.content_splitter, 1)
         self.setMinimumHeight(620)
 
+    def toggle_processing_controls(self) -> None:
+        self._processing_controls_expanded = not self._processing_controls_expanded
+        expanded = self._processing_controls_expanded
+        self.processing_controls_body.setVisible(expanded)
+        self.processing_controls_toggle.setArrowType(
+            Qt.ArrowType.UpArrow if expanded else Qt.ArrowType.DownArrow
+        )
+        self.processing_controls_toggle.setToolTip(
+            "收起翻译设置" if expanded else "展开翻译设置"
+        )
+
+    def toggle_preview(self) -> None:
+        self._preview_expanded = not self._preview_expanded
+        expanded = self._preview_expanded
+        self.preview_body.setVisible(expanded)
+        self.preview_title.setVisible(expanded)
+        self.preview_card.setMaximumWidth(16_777_215 if expanded else 52)
+        self.preview_toggle.setArrowType(
+            Qt.ArrowType.UpArrow if expanded else Qt.ArrowType.LeftArrow
+        )
+        self.preview_toggle.setToolTip("收起预览" if expanded else "展开预览")
+        if expanded:
+            self.queue_preview_splitter.setSizes([620, 500])
+        else:
+            self.queue_preview_splitter.setSizes([1, 52])
+
     def refresh_data(self):
         selected_project = self.project_combo.currentData()
-        selected_profile = self.profile_combo.currentData()
         self.projects = self.store.list_projects()
         for project in self.projects:
             for chapter in project.get("chapters", []):
@@ -1550,15 +1792,14 @@ class TranslationTab(QWidget):
             if index >= 0:
                 self.project_combo.setCurrentIndex(index)
         self.project_combo.blockSignals(False)
+        self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
+        self.profile_combo.addItem("请选择 API 配置", None)
         for profile in self.profiles:
             self.profile_combo.addItem(
                 f"{profile['name']} · {profile['provider']}", profile["id"]
             )
-        if selected_profile:
-            index = self.profile_combo.findData(selected_profile)
-            if index >= 0:
-                self.profile_combo.setCurrentIndex(index)
+        self.profile_combo.blockSignals(False)
         self.project_changed()
 
     def current_project(self) -> dict | None:
@@ -1574,7 +1815,9 @@ class TranslationTab(QWidget):
         if not project:
             self.mode_display.setText("未选择项目")
             self.start_button.setEnabled(False)
+            self.save_settings_button.setEnabled(False)
             return
+        self.save_settings_button.setEnabled(True)
         processing_mode = project.get("processing_mode")
         if processing_mode not in TRANSLATION_MODES:
             self.mode_display.setText("未设置（请到项目导入页选择）")
@@ -1625,14 +1868,25 @@ class TranslationTab(QWidget):
             control.blockSignals(True)
         try:
             token_value = settings.get("max_output_tokens", 24000)
-            self.max_tokens.setValue(
-                int(token_value) if isinstance(token_value, int) else 24000
+            valid_token = (
+                type(token_value) is int
+                and self.max_tokens.minimum()
+                <= token_value
+                <= self.max_tokens.maximum()
             )
+            self.max_tokens.setValue(token_value if valid_token else 24000)
             profile_id = settings.get("profile_id")
+            self.profile_combo.setItemText(0, "请选择 API 配置")
+            self.profile_combo.setToolTip("")
+            self.profile_combo.setCurrentIndex(0)
             profile_index = self.profile_combo.findData(profile_id)
-            if profile_index >= 0:
+            if profile_id and profile_index >= 0:
                 self.profile_combo.setCurrentIndex(profile_index)
-            save_extra = bool(settings.get("save_extra_instructions", False))
+            elif profile_id:
+                message = "已保存的 API 配置不可用，请重新选择并保存项目配置"
+                self.profile_combo.setItemText(0, message)
+                self.profile_combo.setToolTip(message)
+            save_extra = settings.get("save_extra_instructions") is True
             self.save_extra_instructions.setChecked(save_extra)
             self.extra_instructions.setPlainText(
                 str(settings.get("extra_instructions", "")) if save_extra else ""
@@ -1665,6 +1919,11 @@ class TranslationTab(QWidget):
             if existing.get("id") == updated.get("id"):
                 self.projects[index] = updated
                 break
+        QMessageBox.information(
+            self,
+            "保存完成",
+            f"API 配置和处理参数已保存到项目“{updated['name']}”。",
+        )
 
     def selected_chapter_ids(self) -> list[str]:
         result = []
@@ -1727,15 +1986,6 @@ class TranslationTab(QWidget):
         chapter_id = item.data(Qt.ItemDataRole.UserRole) if item else None
         if not project or not chapter_id:
             return menu
-        chapter = self.store.get_chapter(project["id"], chapter_id)
-        translations = chapter.get("translations", [])
-        latest = translations[-1] if translations else {}
-        if (
-            latest.get("review_status") == "需要复核"
-            and latest.get("residual_sources")
-        ):
-            action = menu.addAction("复核残留原词…")
-            action.triggered.connect(lambda: self.open_residual_review(chapter_id))
         return menu
 
     def show_chapter_context_menu(self, position) -> None:
@@ -1779,6 +2029,9 @@ class TranslationTab(QWidget):
                 return
         if retry_sources:
             self.pending_retries.append((chapter_id, retry_sources))
+            if not self.worker or not self.worker.isRunning():
+                queued_chapter_id, queued_sources = self.pending_retries.pop(0)
+                self.start_residual_retry(queued_chapter_id, queued_sources)
 
     def delete_selected_chapters(self):
         if self.worker and self.worker.isRunning():
@@ -1856,6 +2109,13 @@ class TranslationTab(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "无法读取 API 配置", str(exc))
             return
+        pending_skill_count = len(self.store.pending_skill_analysis(project["id"]))
+        skill_analysis_notice = (
+            f"\n\n其中有 {pending_skill_count} 份新增或已修改的 Skill，将先各解析一次；"
+            "未修改的 Skill 不会重复解析。"
+            if pending_skill_count
+            else ""
+        )
         answer = QMessageBox.question(
             self,
             "开始翻译",
@@ -1863,11 +2123,11 @@ class TranslationTab(QWidget):
             f"{profile['model']}。\n\n这会把所选小说正文、项目 Skill、替换清单和"
             f"本次额外要求（{len(self.extra_instructions.toPlainText().strip())} 字）"
             "发送给该服务商，并可能产生 API 费用；若返回格式异常，程序可能"
-            "补发一次格式修复请求。是否继续？",
+            "补发一次格式修复请求。" + skill_analysis_notice + "是否继续？",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.store.mark_chapters_retrying(project["id"], chapter_ids)
+        self.store.mark_chapters_queued(project["id"], chapter_ids)
         for chapter_id in chapter_ids:
             row = self.row_by_chapter.get(chapter_id)
             if row is not None:
@@ -1891,6 +2151,7 @@ class TranslationTab(QWidget):
             self.max_tokens.value(),
         )
         self.worker.progress_changed.connect(self.update_progress)
+        self.worker.chapter_started.connect(self.chapter_started)
         self.worker.chapter_succeeded.connect(self.chapter_succeeded)
         self.worker.chapter_failed.connect(self.chapter_failed)
         self.worker.log_message.connect(self.log.append)
@@ -1901,12 +2162,20 @@ class TranslationTab(QWidget):
         if self.worker:
             self.worker.cancel()
             self.cancel_button.setEnabled(False)
+            # The worker already owns a copy of the selected profile.  Let the
+            # user prepare the next batch while an in-flight request unwinds.
+            self.profile_combo.setEnabled(True)
             self.progress_label.setText("正在取消；当前网络请求结束后停止…")
 
     def update_progress(self, value: int, maximum: int, text: str):
         self.progress_bar.setRange(0, maximum)
         self.progress_bar.setValue(value)
         self.progress_label.setText(text)
+
+    def chapter_started(self, chapter_id: str):
+        row = self.row_by_chapter.get(chapter_id)
+        if row is not None:
+            self.chapter_table.item(row, 3).setText("处理中")
 
     def chapter_succeeded(self, chapter_id: str, result: dict):
         row = self.row_by_chapter.get(chapter_id)
@@ -1917,9 +2186,6 @@ class TranslationTab(QWidget):
             self.translation_preview.setPlainText(result["translated_text"])
         if result["warnings"]:
             self.log.append("  提示：" + "；".join(result["warnings"]))
-        residuals = result.get("residual_sources", [])
-        if residuals and not self.retry_in_progress:
-            self.open_residual_review(chapter_id, residuals)
 
     def chapter_failed(self, chapter_id: str, error: str):
         row = self.row_by_chapter.get(chapter_id)
@@ -1945,11 +2211,41 @@ class TranslationTab(QWidget):
                 self.chapter_table.item(row, 3).setText(
                     latest_status.get(chapter_id, "待处理")
                 )
-        if not cancelled:
+        window = self.window()
+        background = getattr(window, "_hidden_in_background", False)
+        if not cancelled and background:
+            window.tray_icon.showMessage(
+                "小说本地化工作台",
+                "后台翻译任务已完成。点击托盘图标可查看结果。",
+            )
+        elif not cancelled:
             QMessageBox.information(self, "翻译完成", "所选章节已处理完成。")
-        if self.pending_retries and not cancelled:
-            chapter_id, residuals = self.pending_retries.pop(0)
-            self.start_residual_retry(chapter_id, residuals)
+
+    def start_all_review_polish(self):
+        project = self.current_project()
+        if not project:
+            QMessageBox.warning(self, "无法启动", "请先选择小说项目。")
+            return
+        chapter_ids = chapters_requiring_review(project)
+        if not chapter_ids:
+            QMessageBox.information(self, "无需润色", "当前项目没有需要复核的章节。")
+            return
+        residuals: list[str] = []
+        for chapter in project.get("chapters", []):
+            if str(chapter.get("id", "")) not in chapter_ids:
+                continue
+            latest = chapter.get("translations", [])[-1] if chapter.get("translations") else {}
+            residuals.extend(str(item) for item in latest.get("residual_sources", []))
+        answer = QMessageBox.question(
+            self,
+            "API 全章润色重做",
+            f"将让 API 逐章重读并润色 {len(chapter_ids)} 个待复核章节，"
+            "覆盖这些章节的旧译文，可能产生 API 费用。\n\n"
+            "不会处理已完成章节，也不会复用其他文件的同名映射。是否继续？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.start_residual_retry("", list(dict.fromkeys(residuals)))
 
     def start_residual_retry(self, chapter_id: str, residuals: list[str]):
         project = self.current_project()
@@ -1958,26 +2254,51 @@ class TranslationTab(QWidget):
             return
         profile = self.api_store.get_profile(profile_id, reveal_key=True)
         if not profile:
+            QMessageBox.warning(self, "无法启动 API 重做", "请选择可用的 API 配置后重试。")
             return
+        chapter_ids = chapters_requiring_review(project)
+        if not chapter_ids:
+            QMessageBox.information(self, "无需重做", "当前项目没有需要复核的章节。")
+            return
+        self.store.mark_chapters_queued(project["id"], chapter_ids)
+        for queued_chapter_id in chapter_ids:
+            row = self.row_by_chapter.get(queued_chapter_id)
+            if row is not None:
+                self.chapter_table.item(row, 3).setText("全书自动复核中")
         self.retry_in_progress = True
+        self._automatic_review_report = None
         self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
+        self.progress_bar.setRange(0, len(chapter_ids))
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("正在启动 API 全章润色重做…")
+        self.log.append("  已启动 API 全章润色重做。")
         instruction = (
             self.extra_instructions.toPlainText().strip()
-            + "\n这是用户确认的一次残留修正：必须将以下原人名或地名全部替换为"
-            "已确认设定表中的新名称，不得再次保留："
+            + "\n这是逐章完整润色重做。只根据本章原文和旧译文统一人名与称呼；"
+            "不得采用其他文件的同名映射。此前误报词仅供核实："
             + "、".join(residuals)
         ).strip()
         self.worker = TranslationWorker(
-            self.store, project["id"], [chapter_id], profile,
+            self.store, project["id"], chapter_ids, profile,
             project["processing_mode"], instruction, self.max_tokens.value(),
+            automatic_review_sources=residuals,
         )
         self.worker.progress_changed.connect(self.update_progress)
+        self.worker.chapter_started.connect(self.chapter_started)
         self.worker.chapter_succeeded.connect(self.chapter_succeeded)
         self.worker.chapter_failed.connect(self.chapter_failed)
         self.worker.log_message.connect(self.log.append)
+        self.worker.automatic_review_result.connect(self.automatic_review_reported)
         self.worker.task_finished.connect(self.retry_finished)
         self.worker.start()
+
+    def automatic_review_reported(self, report: dict) -> None:
+        self._automatic_review_report = dict(report)
+        if report.get("success"):
+            self.log.append("  已开始逐章全文润色；不会建立跨文件同名映射。")
+        else:
+            self.log.append(f"  API 实体复核失败：{report.get('error', '未知错误')}")
 
     def retry_finished(self, cancelled: bool):
         self.retry_in_progress = False
@@ -1985,7 +2306,28 @@ class TranslationTab(QWidget):
         self.cancel_button.setEnabled(False)
         self.project_combo.setEnabled(True)
         self.profile_combo.setEnabled(True)
+        self.projects = self.store.list_projects()
         self.project_changed()
+        project = self.current_project()
+        if project:
+            latest_project = self.store.load_project(project["id"])
+            summary = format_automatic_review_summary(
+                latest_project, cancelled=cancelled
+            )
+            report = format_automatic_review_report(
+                self._automatic_review_report, summary
+            )
+            self.progress_label.setText(summary)
+            self.log.append("  " + report.replace("\n", "；"))
+            window = self.window()
+            if getattr(window, "_hidden_in_background", False):
+                window.tray_icon.showMessage("小说本地化工作台", report)
+            else:
+                QMessageBox.information(
+                    self,
+                    "自动复核已取消" if cancelled else "自动复核结果",
+                    report,
+                )
         if self.pending_retries and not cancelled:
             chapter_id, residuals = self.pending_retries.pop(0)
             self.start_residual_retry(chapter_id, residuals)
@@ -1998,11 +2340,23 @@ class TranslationTab(QWidget):
         path = self.store.project_dir(project["id"]) / "output"
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def open_completed_output_folder(self):
+        project = self.current_project()
+        if not project:
+            QMessageBox.warning(self, "无法打开", "请先选择小说项目。")
+            return
+        try:
+            path = self.store.refresh_completed_output(project["id"])
+        except (OSError, ValidationError) as exc:
+            QMessageBox.warning(self, "无法打开", f"无法整理已完成译文：{exc}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self._closing_after_workers = False
+        self._hidden_in_background = False
         self.data_root = application_data_root()
         self.project_store = ProjectStore(self.data_root)
         self.api_store = APIConfigStore(self.data_root)
@@ -2010,6 +2364,33 @@ class MainWindow(QMainWindow):
         self.resize(1280, 850)
         self.setMinimumSize(1020, 700)
         self._build()
+        self._build_tray_icon()
+
+    def _build_tray_icon(self) -> None:
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        )
+        self.tray_icon.setToolTip("小说本地化工作台")
+        tray_menu = QMenu(self)
+        show_action = tray_menu.addAction("打开工作台")
+        show_action.triggered.connect(self.show_from_tray)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._tray_activated)
+
+    def _tray_activated(self, reason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.show_from_tray()
+
+    def show_from_tray(self) -> None:
+        self._hidden_in_background = False
+        self.tray_icon.hide()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def _build(self):
         root = QWidget()
@@ -2051,16 +2432,9 @@ class MainWindow(QMainWindow):
         api_scroll.setWidgetResizable(True)
         api_scroll.setFrameShape(QFrame.Shape.NoFrame)
         api_scroll.setWidget(self.api_tab)
-        translation_scroll = QScrollArea()
-        translation_scroll.setWidgetResizable(True)
-        translation_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        translation_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        translation_scroll.setWidget(self.translation_tab)
         self.tabs.addTab(project_scroll, "01  项目导入")
         self.tabs.addTab(api_scroll, "02  API 与 Key")
-        self.tabs.addTab(translation_scroll, "03  翻译处理")
+        self.tabs.addTab(self.translation_tab, "03  翻译处理")
         self.project_tab.projects_changed.connect(self.translation_tab.refresh_data)
         self.api_tab.profiles_changed.connect(self.translation_tab.refresh_data)
         layout.addWidget(self.tabs, 1)
@@ -2076,37 +2450,43 @@ class MainWindow(QMainWindow):
             if worker is not None and worker.isRunning()
         ]
         if not running:
+            self.tray_icon.hide()
             event.accept()
             return
-        if self._closing_after_workers:
-            event.ignore()
-            return
-        answer = QMessageBox.question(
-            self,
-            "任务仍在进行",
-            "当前还有 API 请求正在处理。是否取消任务，并在当前网络请求结束后退出？",
+        self._hidden_in_background = True
+        self.tray_icon.show()
+        self.tray_icon.showMessage(
+            "小说本地化工作台",
+            "窗口已关闭，翻译任务正在后台继续处理。",
         )
-        if answer != QMessageBox.StandardButton.Yes:
-            event.ignore()
-            return
-        self._closing_after_workers = True
-        if translation_worker and translation_worker.isRunning():
-            translation_worker.cancel()
-            translation_worker.finished.connect(self.close)
-        if test_worker and test_worker.isRunning():
-            test_worker.cancel_event.set()
-            test_worker.finished.connect(self.close)
         self.hide()
         event.ignore()
+
+
+def _acquire_instance_lock(data_root: Path) -> QLockFile | None:
+    data_root.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(data_root / ".novel_localizer.lock"))
+    lock.setStaleLockTime(30_000)
+    return lock if lock.tryLock(0) else None
 
 
 def run_desktop_app():
     app = QApplication(sys.argv)
     app.setApplicationName("小说本地化工作台")
     app.setOrganizationName("NovelLocalizer")
+    instance_lock = _acquire_instance_lock(application_data_root())
+    if instance_lock is None:
+        QMessageBox.information(
+            None,
+            "程序已在运行",
+            "小说本地化工作台已经打开，可能隐藏在系统托盘中。",
+        )
+        return 0
     app.setStyle("Fusion")
     app.setFont(QFont("Microsoft YaHei UI", 9))
     app.setStyleSheet(APP_STYLE)
     window = MainWindow()
     window.show()
-    return app.exec()
+    exit_code = app.exec()
+    instance_lock.unlock()
+    return exit_code

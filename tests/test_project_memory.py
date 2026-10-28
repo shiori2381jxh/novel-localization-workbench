@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from novel_localizer.domain import ValidationError
@@ -20,6 +22,41 @@ class ProjectMemoryStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_concurrent_chapter_memory_updates_do_not_overwrite_each_other(self):
+        original_load = self.memory.load
+        barrier = threading.Barrier(2)
+
+        def synchronized_load(project_id):
+            memory = original_load(project_id)
+            try:
+                barrier.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+            return memory
+
+        self.memory.load = synchronized_load
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(
+                        self.memory.update_chapter_memory,
+                        self.project["id"], chapter_id, value,
+                    )
+                    for chapter_id, value in (
+                        ("chapter-1", {"summary": "一"}),
+                        ("chapter-2", {"summary": "二"}),
+                    )
+                ]
+                for future in futures:
+                    future.result()
+        finally:
+            self.memory.load = original_load
+
+        self.assertEqual(
+            {"chapter-1", "chapter-2"},
+            set(self.memory.load(self.project["id"])["chapter_memory"]),
+        )
 
     def test_candidates_require_confirmation_and_increment_version(self):
         saved = self.memory.save_candidates(

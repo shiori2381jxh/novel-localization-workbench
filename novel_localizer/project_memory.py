@@ -3,9 +3,19 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+from functools import wraps
 
 from .domain import ValidationError, forced_rename_validation_error
 from .storage import ProjectStore, _atomic_write_json, _read_json, utc_now
+
+
+def _project_memory_transaction(method):
+    @wraps(method)
+    def locked(self, project_id, *args, **kwargs):
+        with self.store.project_lock(project_id):
+            return method(self, project_id, *args, **kwargs)
+
+    return locked
 
 
 class ProjectMemoryStore:
@@ -31,6 +41,7 @@ class ProjectMemoryStore:
             },
         )
 
+    @_project_memory_transaction
     def save_candidates(
         self, project_id: str, chapter_ids: list[str], candidates: list[dict],
         *, chapter_memory: dict | None = None,
@@ -66,6 +77,7 @@ class ProjectMemoryStore:
             memory["draft_preparation"] = deepcopy(preparation)
         return self._write(memory)
 
+    @_project_memory_transaction
     def confirm_candidates(self, project_id: str, edits: list[dict]) -> dict:
         memory = self.load(project_id)
         entities = {
@@ -130,6 +142,7 @@ class ProjectMemoryStore:
             if item.get("status") == "已确认"
         ]
 
+    @_project_memory_transaction
     def update_chapter_memory(
         self, project_id: str, chapter_id: str, chapter_memory: dict
     ) -> dict:
